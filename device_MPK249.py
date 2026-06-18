@@ -65,6 +65,14 @@ DEBUG = True
 # pads are still unmapped stubs; they simply do nothing yet.)
 CAPTURE_ONLY = False
 
+# High-rate "stream" message types whose LOGGING is suppressed so they don't
+# flood the Script output and bury the messages we care about (e.g. pad
+# Note-Ons hidden under a torrent of pad aftertouch). Dispatch is unaffected --
+# only the debug print is skipped.
+#   0xD0 = channel aftertouch (pressure)   0xA0 = poly aftertouch
+#   0xE0 = pitch bend
+LOG_SUPPRESS_TYPES = (0xD0, 0xA0, 0xE0)
+
 # --- Ports -------------------------------------------------------------------
 # The MPK249 exposes four MIDI ports. In FL Studio's MIDI settings each port can
 # be bound to this script. event.port reflects the port number the user typed in
@@ -110,13 +118,31 @@ TRANSPORT_CC_LOOP = 114
 TRANSPORT_CC_FORWARD = 116
 TRANSPORT_CC_BACK = 115
 
-# --- Pads (Channel 10, Note On/Off) ------------------------------------------
-# Bank A base note is the MPC standard (36 / C1). Bank B/C/D offsets and whether
-# the pads re-use notes or shift them are UNCONFIRMED -- pad handling is stubbed
-# until captured.
-PAD_MIDI_CHANNEL = 10        # 1-based; status nibble would be 9 (0x99 / 0x89)
-PAD_BANK_A_BASE = 36         # <-- VERIFY
+# --- Keyboard performance controls (pitch / mod wheel) -----------------------
+# FINDING (verified 2026-06-17): when a port is bound to a controller SCRIPT, FL
+# forwards unhandled *notes* to the selected channel, but NOT pitch bend or mod
+# wheel -- and there is no script API that injects them as performance data the
+# way channels.midiNoteOn injects notes. Attempts via processMIDICC /
+# forwardMIDICC only fed the messages into FL's generic CC-link system (which
+# even mis-linked pitch bend onto a mixer fader). So the script now leaves the
+# wheels completely untouched. Full native wheel support requires running the
+# keyboard port as a generic controller instead -- a pending design decision.
+# Verified raw messages, for reference:
+#   right wheel = CC 1 (Modulation) ; left wheel = Pitch Bend (status 0xE0)
+
+# --- Pads (Note On/Off on MIDI channel 10) -- VERIFIED 2026-06-17 -------------
+# Pads strike Note On (0x99) / Note Off (0x89) on channel 10. Each of the four
+# pad banks (A/B/C/D) sends a distinct contiguous block of 16 notes, so the
+# active bank can be DERIVED from the note number -- no separate bank-switch
+# message is needed. Velocity arrived fixed at 127 (MPK "Full Level" was on;
+# turn it off on the pads for velocity-sensitive playing).
+#   Bank A: 36-51   Bank B: 52-67   Bank C: 68-83   Bank D: 84-99
+PAD_MIDI_CHANNEL = 10        # 1-based (status nibble 9 -> 0x99 / 0x89)
+PAD_BANK_A_BASE = 36         # bottom note of Bank A
 PADS_PER_BANK = 16
+PAD_BANK_COUNT = 4
+PAD_LAST_NOTE = PAD_BANK_A_BASE + PAD_BANK_COUNT * PADS_PER_BANK - 1   # 99
+BANK_NAMES = ("A", "B", "C", "D")
 
 # --- Knobs / Faders (CC on Channel 1) ----------------------------------------
 # CC numbers are user-assignable in the MPK editor; the Preset 11 defaults are
@@ -143,6 +169,15 @@ def _log(message):
     """Print to the FL Studio script output window when DEBUG is on."""
     if DEBUG:
         print("[MPK249] " + str(message))
+
+
+def _should_log(event):
+    """Whether to print this inbound event (filters high-rate noise streams)."""
+    if not DEBUG:
+        return False
+    if event.sysex:
+        return True
+    return (event.status & 0xF0) not in LOG_SUPPRESS_TYPES
 
 
 def _hint(message):
@@ -247,11 +282,34 @@ def _handle_mmc(event):
 # HANDLER: PADS  (stubbed -- awaiting confirmed note map)
 # =============================================================================
 def _handle_pad(event):
-    """Route pad Note On/Off to FPC. Stubbed until the bank note map is verified.
+    """Handle a pad Note On/Off (feedback + bank tracking, then pass through).
 
-    Returns True if handled. Currently always returns False so pad messages fall
-    through to default handling while we capture the real note numbers.
+    Pads send Note On/Off on channel 10 across four banks of 16 contiguous
+    notes (A:36-51, B:52-67, C:68-83, D:84-99). We identify the bank + pad from
+    the note number, show a hint, and remember the active bank. The note is then
+    PASSED THROUGH (we return False so FL still routes it to the selected
+    channel) -- select an FPC or any drum instrument and the pads trigger it.
+
+    Returns False always: this handler observes/annotates but never consumes the
+    note, so playing remains in FL's hands. Keyboard keys (which are also Note
+    messages, but on a different channel) are ignored here via the channel check.
     """
+    # Only the pad channel (10) counts -- keyboard keys are Notes too, on ch 1.
+    if (event.status & 0x0F) != (PAD_MIDI_CHANNEL - 1):
+        return False
+    note = event.data1
+    if note < PAD_BANK_A_BASE or note > PAD_LAST_NOTE:
+        return False  # out of pad range -- leave it alone
+
+    # Feedback + bank tracking only on the strike (Note On with velocity > 0).
+    if (event.status & 0xF0) == midi.MIDI_NOTEON and event.data2 > 0:
+        offset = note - PAD_BANK_A_BASE
+        bank = offset // PADS_PER_BANK
+        pad = offset % PADS_PER_BANK
+        STATE["pad_bank"] = bank
+        _hint("Pad %s%02d  (note %d, vel %d)"
+              % (BANK_NAMES[bank], pad + 1, note, event.data2))
+
     return False
 
 
@@ -327,11 +385,20 @@ def _handle_cc(event):
     """Route Control Change messages.
 
     Transport buttons (verified) arrive here as CC on channel 1 and are consumed
-    by _handle_transport_cc. Knob/fader CCs are not yet mapped and fall through.
+    by _handle_transport_cc. Everything else is intentionally NOT handled so it
+    passes straight through to FL Studio:
+
+      * The right wheel is the Mod wheel -> CC 1 (verified 2026-06-17). Leaving
+        it unhandled lets FL apply modulation natively, which is what users
+        expect. (If a user wants the mod wheel mapped to a specific param, that
+        is a deliberate future addition, not a default.)
+      * Knob/fader CCs are not yet mapped (awaiting hardware capture).
     """
     if _handle_transport_cc(event):
         return True
-    # Knob / fader mapping not yet implemented (awaiting capture).
+    # Mod wheel (CC 1) and all other CCs fall through untouched -- see the note
+    # in the CONFIG block on why the wheels are not forwarded. Knob/fader
+    # mapping is still to be implemented.
     return False
 
 
@@ -357,7 +424,8 @@ def OnMidiIn(event):
     even messages FL Studio might otherwise route or filter. We never set
     event.handled here, so normal dispatch in OnMidiMsg still runs.
     """
-    _log("RAW " + _describe_event(event))
+    if _should_log(event):
+        _log("RAW " + _describe_event(event))
 
 
 def OnSysEx(event):
@@ -384,7 +452,8 @@ def OnMidiMsg(event):
     pitch bend, aftertouch etc. keep working normally). While CAPTURE_ONLY is on
     we never set event.handled -- we only observe.
     """
-    _log("MSG " + _describe_event(event))
+    if _should_log(event):
+        _log("MSG " + _describe_event(event))
 
     # 1) SysEx / MMC transport.
     if event.sysex:
@@ -406,7 +475,9 @@ def OnMidiMsg(event):
             event.handled = True
         return
 
-    # Everything else (keys, pitch bend, aftertouch) is left for FL Studio.
+    # Everything else is left untouched for FL Studio. Keys pass through to the
+    # selected channel natively. Pitch bend (0xE0), mod wheel, and aftertouch are
+    # intentionally NOT handled here -- see the note in the CONFIG block.
 
 
 def OnRefresh(flags):
